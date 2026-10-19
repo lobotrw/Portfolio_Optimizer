@@ -62,7 +62,7 @@ if uploaded_file is not None:
     df = df.set_index(df['time'].values)
 
     # Removing the Date Column
-    df.drop(columns=['time'], axis=1, inplace=True)
+    df.drop(columns=['time'], inplace=True)
 
 if uploaded_file is None:
     c_2.warning('Please upload a file.')
@@ -108,16 +108,26 @@ if uploaded_file is not None:
     if not button:
         st.stop()
 
+    n_assets = len(df.columns)
+    if values[0] * n_assets > 1 or values[1] * n_assets < 1:
+        c_2.error(f"Weight range {values[0]:.2f}-{values[1]:.2f} is infeasible for {n_assets} assets: "
+                  f"the weights must be able to sum to 1 (min x n <= 1 <= max x n).")
+        st.stop()
+
     if method == "Sharpe" and button:
         c_2.write("---")
         c_2.subheader(f"Optimal :blue[{method}] Weights")
         c_2.write("###")
-        weights = ef.max_sharpe()
+        try:
+            weights = ef.max_sharpe()
+        except Exception as err:   # e.g. no asset beats the risk-free rate, or solver failure
+            c_2.error(f"Max-Sharpe optimization failed: {err}")
+            st.stop()
 
         cleaned_weights = ef.clean_weights()
 
-        c_2.bar_chart(cleaned_weights, use_container_width=True, height=500)
-        c_2.dataframe(cleaned_weights, use_container_width = True)
+        c_2.bar_chart(cleaned_weights, width='stretch', height=500)
+        c_2.dataframe(cleaned_weights, width='stretch')
         c_2.write("---")
 
 
@@ -126,12 +136,16 @@ if uploaded_file is not None:
         c_2.write("---")
         c_2.subheader(f"Optimal :blue[{method}] Weights")
         c_2.write("###")
-        weights = ef.min_volatility()
+        try:
+            weights = ef.min_volatility()
+        except Exception as err:
+            c_2.error(f"Min-volatility optimization failed: {err}")
+            st.stop()
   
         cleaned_weights = ef.clean_weights()
 
-        c_2.bar_chart(cleaned_weights, use_container_width=True, height=500)
-        c_2.dataframe(cleaned_weights, use_container_width = True)
+        c_2.bar_chart(cleaned_weights, width='stretch', height=500)
+        c_2.dataframe(cleaned_weights, width='stretch')
         c_2.write("---")
 
     if method == "Omega" and button:
@@ -148,8 +162,8 @@ if uploaded_file is not None:
         
         cleaned_weights = dict(zip(df.columns, optimal_weights))
 
-        c_2.bar_chart(cleaned_weights, use_container_width=True, height=500)
-        c_2.dataframe(cleaned_weights, use_container_width = True)
+        c_2.bar_chart(cleaned_weights, width='stretch', height=500)
+        c_2.dataframe(cleaned_weights, width='stretch')
         c_2.write("---")
         
         # Plot efficient frontier with custom weights
