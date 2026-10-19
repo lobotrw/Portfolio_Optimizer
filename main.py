@@ -55,25 +55,25 @@ if uploaded_file is not None:
     time.sleep(1.0)
     up_done.empty()
 
-    df = pd.DataFrame()
     df = pd.read_csv(uploaded_file)
-    # Setting Date as index
-    df['time'] = pd.to_datetime(df['time'], format='%m-%d-%Y')
-    df = df.set_index(df['time'].values)
-
-    # Removing the Date Column
-    df.drop(columns=['time'], inplace=True)
+    if 'time' not in df.columns:
+        c_2.error("The CSV needs a 'time' column (see the example below).")
+        st.stop()
+    # Setting Date as index: the documented MM-DD-YYYY format first, then any unambiguous date format
+    try:
+        df['time'] = pd.to_datetime(df['time'], format='%m-%d-%Y')
+    except (ValueError, TypeError):
+        try:
+            df['time'] = pd.to_datetime(df['time'], format='mixed')
+        except (ValueError, TypeError) as err:
+            c_2.error(f"Could not parse the 'time' column as dates: {err}")
+            st.stop()
+    df = df.set_index('time').sort_index()
+    df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').ffill().dropna()
 
 if uploaded_file is None:
     c_2.warning('Please upload a file.')
     st.stop()
-
-    # PLOT
-    c_2.subheader("The Modern Portfolio Theory (MPT)", 
-                  help = '''The Modern Portfolio Theory (MPT) refers to an investment theory
-                    that allows investors to assemble an asset portfolio that maximizes expected return for a given level of risk. 
-                    The theory assumes that investors are risk-averse; for a given level of expected return, investors will always prefer the less risky portfolio.''')
-    c_2.pyplot(fig)
 
 # ------------------------------------------------------------------------------------------------------------------------------------
 # INPUTS
@@ -83,155 +83,131 @@ c_2.write("###")
 c_2.write("---")
 c_2.write("###")
 
-if uploaded_file is not None:
-    c_2.subheader("Method of Optimization")
-    method = c_2.radio(
-                      "Set a method and Run optimization ⚙️",
-                      key        =    "visibility",
-                      options    =   ["Sharpe", "Min Volatility", "Omega"],
-                      horizontal =   True
-                        )
-    
-    values = c_2.slider(
-                        "Select a range of weights %",
-                        0.0, 1.0, (0.05, 0.65)
-                        )
-    
-    # Calculate expected returns and sample covariance
-    mu = expected_returns.mean_historical_return(df)
-    S  = risk_models.sample_cov(df)
+freq = po.infer_frequency(df.index)
 
-    # Optimize for maximal Sharpe ratio
-    ef = EfficientFrontier(mu, S, weight_bounds=values)
+c_2.subheader("Method of Optimization")
+method = c_2.radio(
+                  "Set a method and Run optimization ⚙️",
+                  key        =    "visibility",
+                  options    =   ["Sharpe", "Min Volatility", "Omega"],
+                  horizontal =   True
+                    )
 
-    button = c_2.button("Run optimization")
-    if not button:
-        st.stop()
+values = c_2.slider(
+                    "Select a range of weights %",
+                    0.0, 1.0, (0.05, 0.65)
+                    )
 
-    n_assets = len(df.columns)
-    if values[0] * n_assets > 1 or values[1] * n_assets < 1:
-        c_2.error(f"Weight range {values[0]:.2f}-{values[1]:.2f} is infeasible for {n_assets} assets: "
-                  f"the weights must be able to sum to 1 (min x n <= 1 <= max x n).")
-        st.stop()
+train_pct = c_2.slider(
+    "Training share of the data (%)", 30, 100, 70, step=5,
+    help="Weights are optimised on the first part of the data and evaluated on the rest (out-of-sample). "
+         "100 % = optimise and evaluate on the same data (in-sample, hindsight-biased).")
+rf = c_2.number_input("Risk-free rate (annual, %)", min_value=0.0, max_value=20.0, value=0.0, step=0.25) / 100
 
-    if method == "Sharpe" and button:
-        c_2.write("---")
-        c_2.subheader(f"Optimal :blue[{method}] Weights")
-        c_2.write("###")
+c_2.caption(f"Detected {freq} periods per year ({'weekend dates present: 24/7 market' if freq == 365 else 'no weekend dates: trading days'}); "
+            "used for all annualisation.")
+
+train, test = po.train_test_split(df, train_pct / 100)
+if len(train) < 30 or (test is not None and len(test) < 30):
+    c_2.error("Not enough rows for this split: both the training and the test part need at least 30 rows.")
+    st.stop()
+
+# Calculate expected returns and sample covariance on the TRAINING data only
+mu = expected_returns.mean_historical_return(train, frequency=freq)
+S  = risk_models.sample_cov(train, frequency=freq)
+
+ef = EfficientFrontier(mu, S, weight_bounds=values)
+
+button = c_2.button("Run optimization")
+if not button:
+    st.stop()
+
+n_assets = len(df.columns)
+if values[0] * n_assets > 1 or values[1] * n_assets < 1:
+    c_2.error(f"Weight range {values[0]:.2f}-{values[1]:.2f} is infeasible for {n_assets} assets: "
+              f"the weights must be able to sum to 1 (min x n <= 1 <= max x n).")
+    st.stop()
+
+c_2.write("---")
+c_2.subheader(f"Optimal :blue[{method}] Weights")
+c_2.caption(f"Optimised on {train.index[0]:%Y-%m-%d} – {train.index[-1]:%Y-%m-%d} ({len(train)} rows).")
+c_2.write("###")
+
+custom = None
+if method == "Sharpe":
+    try:
+        ef.max_sharpe(risk_free_rate=rf)
+    except Exception as err:   # e.g. no asset beats the risk-free rate, or solver failure
+        c_2.warning(f"Max-Sharpe optimization failed ({err}). Falling back to **Min Volatility** instead.")
+        ef = EfficientFrontier(mu, S, weight_bounds=values)
+        method = "Min Volatility (fallback)"
         try:
-            weights = ef.max_sharpe()
-        except Exception as err:   # e.g. no asset beats the risk-free rate, or solver failure
-            c_2.error(f"Max-Sharpe optimization failed: {err}")
+            ef.min_volatility()
+        except Exception as err2:
+            c_2.error(f"Min-volatility optimization failed too: {err2}")
             st.stop()
+    cleaned_weights = ef.clean_weights()
+elif method == "Min Volatility":
+    try:
+        ef.min_volatility()
+    except Exception as err:
+        c_2.error(f"Min-volatility optimization failed: {err}")
+        st.stop()
+    cleaned_weights = ef.clean_weights()
+else:  # Omega
+    returns = train.pct_change().dropna()
+    custom = po.optimize_omega(returns=returns, threshold=0.0, bounds=values)
+    cleaned_weights = dict(zip(df.columns, np.round(custom, 5)))
 
-        cleaned_weights = ef.clean_weights()
+c_2.bar_chart(cleaned_weights, width='stretch', height=500)
+c_2.dataframe(cleaned_weights, width='stretch')
+c_2.write("---")
 
-        c_2.bar_chart(cleaned_weights, width='stretch', height=500)
-        c_2.dataframe(cleaned_weights, width='stretch')
-        c_2.write("---")
+with c_2:
+    po.plot_ef(5000, ef, method, custom_weights=custom, bounds=values)
 
-
-
-    if method == "Min Volatility" and button:
-        c_2.write("---")
-        c_2.subheader(f"Optimal :blue[{method}] Weights")
-        c_2.write("###")
-        try:
-            weights = ef.min_volatility()
-        except Exception as err:
-            c_2.error(f"Min-volatility optimization failed: {err}")
-            st.stop()
-  
-        cleaned_weights = ef.clean_weights()
-
-        c_2.bar_chart(cleaned_weights, width='stretch', height=500)
-        c_2.dataframe(cleaned_weights, width='stretch')
-        c_2.write("---")
-
-    if method == "Omega" and button:
-        c_2.write("---")
-        c_2.subheader(f"Optimal :blue[{method}] Weights")
-        c_2.write("###")
-        
-        # Calculate returns
-        returns = df.pct_change().dropna()
-        
-        # Get optimal weights using static method
-        optimal_weights = po.optimize_omega(returns=returns, threshold=0.0, bounds=values)
-        weights = pd.Series(optimal_weights, index=df.columns)
-        
-        cleaned_weights = dict(zip(df.columns, optimal_weights))
-
-        c_2.bar_chart(cleaned_weights, width='stretch', height=500)
-        c_2.dataframe(cleaned_weights, width='stretch')
-        c_2.write("---")
-        
-        # Plot efficient frontier with custom weights
-        po.plot_ef(5000, ef, method, custom_weights=optimal_weights)
-
-    else:
-        # For other optimization methods
-        po.plot_ef(5000, ef, method)
-
-
-    weights = pd.DataFrame({'Weights': weights})
-
-# ------------------------------------------------------------------------------------------------------------------------------------
-
+weights = pd.Series(cleaned_weights, dtype=float)
 
 # ------------------------------------------------------------------------------------------------------------------------------------
 # Portfolio Performance
 # ------------------------------------------------------------------------------------------------------------------------------------
 
-    c_2.write("---")
-    c_2.subheader("Portfolio :blue[Performance]")
+def metrics(prices, w):
+    port = po.portfolio_value(prices, w)          # capital-weighted buy-and-hold, starts at 1.0
+    return port, {
+        "Total return":          f"{(port.iloc[-1] - 1) * 100:.2f} %",
+        "Sharpe Ratio":          f"{po.sharpe(port, freq, rf):.2f}",
+        "Sortino Ratio":         f"{po.sortino(port, freq, rf):.2f}",
+        "Omega Ratio":           f"{po.omega(port):.2f}",
+        "AVG Daily Volatility":  f"{po.daily_vol(port) * 100:.2f} %",
+        "AVG Monthly Volatility": f"{po.daily_vol(port) * 100 * np.sqrt(freq / 12):.2f} %",
+        "AVG Annual Volatility": f"{po.daily_vol(port) * 100 * np.sqrt(freq):.2f} %",
+        "Max Draw Down":         f"{po.max_drawdown(port) * 100:.2f} %",
+    }
 
-    asset_names = df.columns
+equal = pd.Series(1 / n_assets, index=df.columns)
+eval_prices = test if test is not None else train
+label = "out-of-sample (test)" if test is not None else "IN-SAMPLE (hindsight: same data used to optimise)"
 
-    for asset in df.columns:
-        df[asset] = df[asset] * weights.loc[asset, 'Weights']
+c_2.write("---")
+c_2.subheader("Portfolio :blue[Performance]")
+c_2.caption(f"Evaluated {label}: {eval_prices.index[0]:%Y-%m-%d} – {eval_prices.index[-1]:%Y-%m-%d}. "
+            "Buy-and-hold, each asset gets its weight of the starting capital.")
 
-    df['Portfolio'] = df.sum(axis=1)
+port, m_opt = metrics(eval_prices, weights)
+port_eq, m_eq = metrics(eval_prices, equal)
+_, m_in = metrics(train, weights)
 
-    final_df = df[['Portfolio']]
-
-    maxdd_      = np.round(po.max_drawdown(final_df['Portfolio'])*100, 2)
-    maxdd_rol   = po.rol_max_drawdown(final_df['Portfolio']*100)
-    cum_ret     = np.round((np.exp(np.log1p(final_df.pct_change()['Portfolio']).cumsum()).iloc[-1]) * 100, 2)
-
-    daily_vol    = np.round(po.daily_vol(final_df).iloc[0]*100, 2)
-    monthly_vol = np.round(po.daily_vol(final_df).iloc[0]*100 * np.sqrt(30), 2)
-    annual_vol  = np.round(po.daily_vol(final_df).iloc[0]*100 * np.sqrt(365), 2)
-
-    sharpe      = np.round(po.sharpe(final_df).iloc[0], 2)
-    sortino     = np.round(po.sortino(final_df).iloc[0], 2)
-    omega       = np.round(po.omega(final_df).iloc[0], 2)
-
-
-    # Portfolio Metrics Plot
-    with c_2:
-        st.area_chart(final_df/10)
-        st.write("---")
-
-        c1,c2,c3= st.columns([2,3,1])
-        c1.write(f"Cumulative returns:"),        c2.write(f"{cum_ret} %")
-        c1.write("---"),                         c2.write("---")
-        c1.write(f"Sharpe Ratio:"),              c2.write(f"{sharpe}")
-        c1.write(f"Sortino Ratio:"),             c2.write(f"{sortino}")
-        c1.write(f"Omega Ratio:"),               c2.write(f"{omega}")
-        c1.write("---"),                         c2.write("---")
-        c1.write(f"AVG Daily Volatility:"),      c2.write(f"{daily_vol} %")
-        c1.write(f"AVG Monthly Volatility:"),    c2.write(f"{monthly_vol} %")
-        c1.write(f"AVG Annual Volatility:"),     c2.write(f"{annual_vol} %")
-        c1.write("---"),                         c2.write("---")    
-        c1.write(f"Max Draw Down:"),             c2.write(f"{maxdd_} %")
-
-
-        st.area_chart(maxdd_rol*100, color="#d14747")
-    
-else:
-    st.stop()
-
+with c_2:
+    st.line_chart(pd.DataFrame({"Optimised portfolio": port, "Equal weight": port_eq}),
+                  y_label="Growth of $1")
+    st.write("---")
+    table = pd.DataFrame({f"Optimised ({'test' if test is not None else 'in-sample'})": m_opt,
+                          "Equal weight (same period)": m_eq})
+    if test is not None:
+        table["Optimised (train, in-sample)"] = pd.Series(m_in)
+    st.table(table)
+    st.area_chart(po.rol_max_drawdown(port) * 100, color="#d14747", y_label="Drawdown %")
 
 c1_,c2_,c3_= st.columns([0.5,6,0.5])
 

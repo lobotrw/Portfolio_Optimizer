@@ -1,23 +1,23 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import streamlit as st
 from pypfopt import expected_returns
 from scipy.optimize import minimize
 
 
 class portfolio_optimization:
-    def sharpe(src): 
-        d_r     = src.pct_change()
-        std     = d_r.std()
-        mean    = d_r.mean()
-        return (mean / std) * np.sqrt(365)
+    # All ratio/volatility metrics take ``freq`` = periods per year (365 for 24/7 crypto, 252 for stocks).
+    def sharpe(src, freq=365, rf=0.0):
+        d_r     = src.pct_change().dropna() - rf / freq
+        return (d_r.mean() / d_r.std()) * np.sqrt(freq)
 
 
-    def sortino(src):
-        d_r      = src.pct_change()
-        stdv_neg = (d_r[d_r < 0]*-1).std()
-        mean     = d_r.mean()
-        return (mean / stdv_neg) * np.sqrt(365)
+    def sortino(src, freq=365, rf=0.0):
+        """Standard Sortino: downside deviation sqrt(mean(min(r, 0)^2)) over ALL periods."""
+        d_r      = src.pct_change().dropna() - rf / freq
+        downside = np.sqrt((d_r.clip(upper=0) ** 2).mean())
+        return (d_r.mean() / downside) * np.sqrt(freq)
 
     def omega(src):
         d_r      = src.pct_change()
@@ -45,8 +45,30 @@ class portfolio_optimization:
         return d_r.std()
 
     @staticmethod
-    def plot_ef(n_samples, ef, label, custom_weights=None):
-        w = np.random.dirichlet(np.ones(ef.n_assets), n_samples)
+    def infer_frequency(index):
+        """365 if the data contains weekend dates (24/7 market such as crypto), else 252."""
+        idx = pd.DatetimeIndex(index)
+        return 365 if (idx.dayofweek >= 5).any() else 252
+
+    @staticmethod
+    def portfolio_value(prices, weights):
+        """Buy-and-hold portfolio value starting at 1.0: each asset gets ``weight`` of the
+        starting capital (prices normalised to their first value), not weight x price level."""
+        w = pd.Series(weights, dtype=float).reindex(prices.columns).fillna(0.0)
+        return (prices / prices.iloc[0]).mul(w, axis=1).sum(axis=1)
+
+    @staticmethod
+    def train_test_split(prices, train_frac):
+        """Chronological split. The test set starts on the last training day so that the
+        first test return is the first day after training (no overlap of returns)."""
+        if train_frac >= 1.0:
+            return prices, None
+        cut = int(len(prices) * train_frac)
+        return prices.iloc[:cut], prices.iloc[cut - 1:]
+
+    @staticmethod
+    def plot_ef(n_samples, ef, label, custom_weights=None, bounds=(0.0, 1.0)):
+        w = portfolio_optimization.random_weights(ef.n_assets, n_samples, bounds)
         rets = w.dot(ef.expected_returns)
         stds = np.sqrt(np.diag(w @ ef.cov_matrix @ w.T))
         sharpes = rets / stds
@@ -73,6 +95,20 @@ class portfolio_optimization:
 
         st.subheader("The Modern Portfolio Theory (MPT)", help="The Modern Portfolio Theory (MPT) refers to an investment theory that allows investors to assemble an asset portfolio that maximizes expected return for a given level of risk. The theory assumes that investors are risk-averse; for a given level of expected return, investors will always prefer the less risky portfolio.")
         st.pyplot(fig)
+
+    @staticmethod
+    def random_weights(n_assets, n_samples, bounds=(0.0, 1.0), seed=0, max_rounds=50):
+        """Dirichlet draws rejection-sampled to the user's weight bounds."""
+        rng = np.random.default_rng(seed)
+        lo, hi = bounds
+        kept = []
+        for _ in range(max_rounds):
+            w = rng.dirichlet(np.ones(n_assets), n_samples * 4)
+            kept.append(w[((w >= lo - 1e-12) & (w <= hi + 1e-12)).all(axis=1)])
+            if sum(len(k) for k in kept) >= n_samples:
+                break
+        w = np.vstack(kept)[:n_samples]
+        return w if len(w) else np.full((1, n_assets), 1 / n_assets)
 
     @staticmethod
     def omega_ratio(weights, returns, threshold=0):
